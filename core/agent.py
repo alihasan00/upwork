@@ -3,14 +3,13 @@ from .prompts import (
     CONCISE_WRITER_STYLE,
     DETAILED_WRITER_STYLE,
     INSIGHT_WRITER_STYLE,
-    DATA_WRITER_STYLE,
-    FORMULA_EVALUATOR_INSTRUCTIONS,
-    CONVERSION_EVALUATOR_INSTRUCTIONS,
+    EVALUATOR_ORCHESTRATOR_INSTRUCTIONS,
     PRE_ANALYSIS_INSTRUCTIONS,
     HUMANIZER_INSTRUCTIONS,
+    REVISION_INSTRUCTIONS,
     PROFILE,
 )
-import asyncio
+from .gemmini import gemini_flash_model, gemini_pro_model
 import logging
 import time
 from pydantic import BaseModel
@@ -37,160 +36,73 @@ class Proposal(BaseModel):
     proposal: str
 
 
-class EvaluationScore(BaseModel):
-    agent_name: str
-    score: int  # 1–10
-    feedback: str
-
-
-class ProposalEvaluation(BaseModel):
-    scores: list[EvaluationScore]
-    winner: str
-    reasoning: str
-
-
 # ---------------------------------------------------------------------------
-# Evaluator weights — ConversionEvaluator counts 2x
+# Static agents (no per-job context needed)
 # ---------------------------------------------------------------------------
-
-EVALUATOR_WEIGHTS: dict[str, float] = {
-    "FormulaEvaluator": 1.0,
-    "ConversionEvaluator": 2.0,
-}
-
-# ---------------------------------------------------------------------------
-# Agents
-# ---------------------------------------------------------------------------
-
-concise_writer = Agent(
-    name="ConciseWriter",
-    model="gpt-4.1",
-    instructions=INSTRUCTIONS + CONCISE_WRITER_STYLE,
-    output_type=Proposal,
-)
-
-detailed_writer = Agent(
-    name="DetailedWriter",
-    model="gpt-4.1",
-    instructions=INSTRUCTIONS + DETAILED_WRITER_STYLE,
-    output_type=Proposal,
-)
-
-insight_writer = Agent(
-    name="InsightWriter",
-    model="gpt-4.1",
-    instructions=INSTRUCTIONS + INSIGHT_WRITER_STYLE,
-    output_type=Proposal,
-)
-
-data_writer = Agent(
-    name="DataWriter",
-    model="gpt-4.1",
-    instructions=INSTRUCTIONS + DATA_WRITER_STYLE,
-    output_type=Proposal,
-)
-
-formula_evaluator = Agent(
-    name="FormulaEvaluator",
-    model="gpt-4.1-mini",
-    instructions=FORMULA_EVALUATOR_INSTRUCTIONS,
-    output_type=ProposalEvaluation,
-)
-
-conversion_evaluator = Agent(
-    name="ConversionEvaluator",
-    model="gpt-4.1-mini",
-    instructions=CONVERSION_EVALUATOR_INSTRUCTIONS,
-    output_type=ProposalEvaluation,
-)
 
 pre_analysis_agent = Agent(
     name="PreAnalysisAgent",
-    model="gpt-4.1-mini",
+    model=gemini_flash_model,  # fast structured signal extraction
     instructions=PRE_ANALYSIS_INSTRUCTIONS,
 )
 
+# Terminal agent — no handoffs
 humanizer_agent = Agent(
     name="HumanizerAgent",
-    model="gpt-4.1",
+    model="gpt-5.2",
     instructions=HUMANIZER_INSTRUCTIONS,
     output_type=Proposal,
 )
 
-WRITERS = [concise_writer, detailed_writer, insight_writer, data_writer]
+# Revises the winning proposal, then hands off to humanizer
+revision_agent = Agent(
+    name="RevisionAgent",
+    model="gpt-5.2",
+    instructions=REVISION_INSTRUCTIONS,
+    output_type=Proposal,
+    handoffs=[humanizer_agent],
+)
+
+# ---------------------------------------------------------------------------
+# Writer templates — cloned inside run_pipeline() with injected context
+# ---------------------------------------------------------------------------
+
+WRITERS = [
+    Agent(
+        name="ConciseWriter",
+        model="gpt-5.2",
+        instructions=INSTRUCTIONS + CONCISE_WRITER_STYLE,
+        output_type=Proposal,
+    ),
+    Agent(
+        name="DetailedWriter",
+        model=gemini_pro_model,
+        instructions=INSTRUCTIONS + DETAILED_WRITER_STYLE,
+        output_type=Proposal,
+    ),
+    Agent(
+        name="InsightWriter",
+        model="gpt-5.2",
+        instructions=INSTRUCTIONS + INSIGHT_WRITER_STYLE,
+        output_type=Proposal,
+    ),
+]
+
 WRITER_STYLES = [
     CONCISE_WRITER_STYLE,
     DETAILED_WRITER_STYLE,
     INSIGHT_WRITER_STYLE,
-    DATA_WRITER_STYLE,
 ]
-EVALUATORS = [formula_evaluator, conversion_evaluator]
 
-# Word limits per writer style — used in quality gates
-WRITER_WORD_LIMITS: dict[str, int] = {
-    "ConciseWriter": 150,
-    "DetailedWriter": 240,
-    "InsightWriter": 200,
-    "DataWriter": 220,
-}
-
-_BANNED_PHRASES = [
-    "ensure",
-    "leverage",
-    "utilize",
-    "seamless",
-    "robust",
-    "cutting-edge",
-    "synergy",
-    "streamline",
-    "delve",
-    "look no further",
-    "i would love to",
-    "feel free to",
-    "don't hesitate",
-    "i'm the perfect fit",
-    "with that said",
-    "i am confident",
-    "proven track record",
-    "best practices",
-    "end-to-end solution",
-    "tailored solution",
-    "tailored approach",
-    "i came across your posting",
-    "i'm reaching out",
-    "i look forward to hearing",
-    "as per your",
-    "touch base",
+WRITER_TOOL_DESCRIPTIONS = [
+    "Write a concise 120–150 word Upwork proposal with a blunt problem-first opener.",
+    "Write a detailed 200–240 word Upwork proposal mirroring the client's language.",
+    "Write an insight-driven 160–200 word Upwork proposal with a competence-based opener.",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Quality gate — logs warnings, does not block
-# ---------------------------------------------------------------------------
-
-
-def _check_quality_gates(proposals: dict[str, str]) -> None:
-    for name, text in proposals.items():
-        word_count = len(text.split())
-        limit = WRITER_WORD_LIMITS.get(name, 250)
-        if word_count > limit:
-            log.warning(
-                "  QUALITY GATE: %s is %d words (limit %d)",
-                name,
-                word_count,
-                limit,
-            )
-        found = [p for p in _BANNED_PHRASES if p in text.lower()]
-        if found:
-            log.warning(
-                "  QUALITY GATE: %s contains banned phrases: %s",
-                name,
-                found,
-            )
-
-
-# ---------------------------------------------------------------------------
-# Pipeline — returns the winning proposal as a plain string
+# Pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -214,6 +126,7 @@ async def run_pipeline(job_post: str, custom_instructions: str = "") -> str:
     signals_text: str = pre_result.final_output
     log.info("Step 0 done — %.1fs\n%s", time.perf_counter() - t0, signals_text)
 
+    # Build writer agents with job-specific context injected into their instructions
     writer_context = (
         base
         + "\n\n---\n\nJOB SIGNALS (extracted for this specific job post):\n"
@@ -232,89 +145,41 @@ async def run_pipeline(job_post: str, custom_instructions: str = "") -> str:
         for w, style in zip(WRITERS, WRITER_STYLES)
     ]
 
-    # --- Step 1: Writers ---
+    # --- Steps 1–3: EvaluatorOrchestrator drives everything from here ---
+    # It calls writers as tools, scores proposals, retries if score < 7,
+    # then hands off → RevisionAgent → HumanizerAgent
     log.info(
-        "Step 1 — running %d writer agents in parallel: %s",
-        len(writers),
+        "Step 1–3 — evaluator orchestrator: writers=%s, retry threshold=7/10",
         [w.name for w in writers],
     )
     t0 = time.perf_counter()
 
-    write_results = await asyncio.gather(
-        *[
-            Runner.run(
-                w, input=f"Write a proposal for this Upwork job post:\n\n{job_post}"
+    evaluator_orchestrator = Agent(
+        name="EvaluatorOrchestrator",
+        model="gpt-5.2",  # evaluates, decides retries, constructs handoff
+        instructions=EVALUATOR_ORCHESTRATOR_INSTRUCTIONS,
+        tools=[
+            writers[i].as_tool(
+                tool_name=writers[i].name.lower(),
+                tool_description=WRITER_TOOL_DESCRIPTIONS[i],
             )
-            for w in writers
-        ]
+            for i in range(len(writers))
+        ],
+        handoffs=[revision_agent],
     )
 
-    log.info("Step 1 done — %.1fs", time.perf_counter() - t0)
-
-    proposals = {
-        writers[i].name: write_results[i].final_output.proposal
-        for i in range(len(writers))
-    }
-    for name, text in proposals.items():
-        log.info("  %-20s %d words", name, len(text.split()))
-
-    # --- Quality gate ---
-    _check_quality_gates(proposals)
-
-    # --- Step 2: Evaluators ---
-    eval_prompt = f"Original job post:\n{job_post}\n\n"
-    for name, text in proposals.items():
-        eval_prompt += f"--- {name} ---\n{text}\n\n"
+    result = await Runner.run(
+        evaluator_orchestrator,
+        input=(
+            f"Job post:\n{job_post}\n\n"
+            f"Job signals:\n{signals_text}"
+        ),
+    )
 
     log.info(
-        "Step 2 — running %d evaluator agents in parallel: %s",
-        len(EVALUATORS),
-        [e.name for e in EVALUATORS],
-    )
-    t0 = time.perf_counter()
-
-    eval_results = await asyncio.gather(
-        *[Runner.run(e, input=eval_prompt) for e in EVALUATORS]
-    )
-
-    log.info("Step 2 done — %.1fs", time.perf_counter() - t0)
-
-    for result, evaluator in zip(eval_results, EVALUATORS):
-        ev: ProposalEvaluation = result.final_output
-        log.info("  %s → winner: %s", evaluator.name, ev.winner)
-        for s in ev.scores:
-            log.info("    %-20s %d/10", s.agent_name, s.score)
-
-    # --- Combine scores (ConversionEvaluator weighted 2x) ---
-    combined: dict[str, float] = {name: 0.0 for name in proposals}
-    total_weight = sum(EVALUATOR_WEIGHTS.get(e.name, 1.0) for e in EVALUATORS)
-
-    for result, evaluator in zip(eval_results, EVALUATORS):
-        weight = EVALUATOR_WEIGHTS.get(evaluator.name, 1.0)
-        for s in result.final_output.scores:
-            if s.agent_name in combined:
-                combined[s.agent_name] += s.score * weight
-
-    winner = max(combined, key=lambda k: combined[k])
-    avg = combined[winner] / total_weight
-    log.info("  Combined scores (weighted): %s", combined)
-
-    # --- Step 3: Humanizer pass on winner ---
-    log.info("Step 3 — humanizer pass on winner: %s", winner)
-    t0 = time.perf_counter()
-
-    humanized_result = await Runner.run(
-        humanizer_agent,
-        input=f"Original job post:\n{job_post}\n\nProposal to humanize:\n{proposals[winner]}",
-    )
-    final_proposal = humanized_result.final_output.proposal
-    log.info("Step 3 done — %.1fs", time.perf_counter() - t0)
-
-    log.info(
-        "Pipeline complete — winner: %s (%.1f/10) — total: %.1fs",
-        winner,
-        avg,
+        "Pipeline complete — total: %.1fs",
         time.perf_counter() - pipeline_start,
     )
 
-    return f"**Winner: {winner} ({avg:.1f}/10)**\n\n{final_proposal}"
+    final: Proposal = result.final_output
+    return final.proposal
